@@ -75,6 +75,25 @@ static settings_tlv_status_t   tlvGlobalStatus = SETTINGS_TLV_OK;  // global-loa
 // Optional "about to factory reset" notification (see esp32Settings_SetFactoryResetNotify).
 static void (*factoryResetNotify)(void) = NULL;
 
+// Per-preset files (esp32Settings_UsePresetFiles). PRESETS_PATH is unused in that mode.
+#define PRESET_DIR                 SETTINGS_BASE_PATH "/presets"
+static bool                         presetFiles      = false;
+static uint16_t                     presetFileCount  = 0;
+static settings_item_serialize_fn   itemSerialize    = NULL;
+static settings_item_deserialize_fn itemDeserialize  = NULL;
+static void                       (*defaultOnePreset)(uint16_t) = NULL;
+// The TLV file helpers take index-free callbacks; these trampolines carry the index.
+static uint16_t                     sItemIndex       = 0;
+
+static bool itemSerializeTramp(tlv_writer_t *w, void *ctx)   { return itemSerialize(w, sItemIndex, ctx); }
+static bool itemDeserializeTramp(tlv_reader_t *r, void *ctx) { return itemDeserialize(r, sItemIndex, ctx); }
+
+static void presetFilePaths(uint16_t index, char *path, char *tmp)
+{
+	sprintf(path, PRESET_DIR "/p%03u.tlv", (unsigned)index);
+	sprintf(tmp,  PRESET_DIR "/p%03u.tmp", (unsigned)index);
+}
+
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels);
 
 // Mount the storage partition. Returns true if mounted (or already mounted).
@@ -304,6 +323,88 @@ void esp32Settings_BootBeginTagged(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Per-preset files
+// ---------------------------------------------------------------------------
+void esp32Settings_UsePresetFiles(uint16_t numPresetFiles,
+                                  settings_item_serialize_fn serialize,
+                                  settings_item_deserialize_fn deserialize,
+                                  void (*defaultOne)(uint16_t index))
+{
+	if (numPresetFiles == 0 || serialize == NULL || deserialize == NULL || defaultOne == NULL) {
+		ESP_LOGE(TAG, "UsePresetFiles: invalid arguments — staying on the single preset file.");
+		return;
+	}
+	presetFiles      = true;
+	presetFileCount  = numPresetFiles;
+	itemSerialize    = serialize;
+	itemDeserialize  = deserialize;
+	defaultOnePreset = defaultOne;
+}
+
+bool esp32Settings_SavePreset(uint16_t index)
+{
+	if (!presetFiles || presetsPtr == NULL || index >= presetFileCount) {
+		ESP_LOGE(TAG, "SavePreset(%u): per-preset files not in use or index out of range.", (unsigned)index);
+		return false;
+	}
+	struct stat st;
+	if (stat(PRESET_DIR, &st) != 0 && mkdir(PRESET_DIR, 0775) != 0) {
+		ESP_LOGE(TAG, "Could not create %s", PRESET_DIR);
+		return false;
+	}
+	char path[48], tmp[48];
+	presetFilePaths(index, path, tmp);
+	sItemIndex = index;
+	if (!esp32SettingsTlv_SaveFile(path, tmp, itemSerializeTramp, tlvCtx)) {
+		ESP_LOGE(TAG, "Preset %u save failed.", (unsigned)index);
+		return false;
+	}
+	return true;
+}
+
+bool esp32Settings_ReadPreset(uint16_t index)
+{
+	if (!presetFiles || presetsPtr == NULL || index >= presetFileCount) {
+		ESP_LOGE(TAG, "ReadPreset(%u): per-preset files not in use or index out of range.", (unsigned)index);
+		return false;
+	}
+	char path[48], tmp[48];
+	presetFilePaths(index, path, tmp);
+	defaultOnePreset(index);   // defaults under any tag absent from the file
+	sItemIndex = index;
+	settings_tlv_status_t st = esp32SettingsTlv_LoadFile(path, itemDeserializeTramp, tlvCtx);
+	if (st == SETTINGS_TLV_OK)
+		return true;
+	// A corrupt file is detected only after its records were decoded, so re-default to drop
+	// whatever was half-applied.
+	defaultOnePreset(index);
+	if (st == SETTINGS_TLV_MISSING)
+		ESP_LOGW(TAG, "Preset %u: no file — defaults.", (unsigned)index);
+	else
+		ESP_LOGW(TAG, "Preset %u: file invalid (status %d) — defaults.", (unsigned)index, (int)st);
+	return false;
+}
+
+// Read every preset file; with `heal`, rewrite any that were missing/corrupt with defaults so
+// the warning does not repeat on every boot.
+static void esp32Settings_ReadPresetFiles(bool heal)
+{
+	uint16_t bad = 0;
+	for (uint16_t i = 0; i < presetFileCount; i++) {
+		if (!esp32Settings_ReadPreset(i)) {
+			bad++;
+			if (heal)
+				esp32Settings_SavePreset(i);
+		}
+	}
+	if (bad)
+		ESP_LOGW(TAG, "%u of %u preset file(s) missing/invalid — reset to defaults%s.",
+		         (unsigned)bad, (unsigned)presetFileCount, heal ? " and rewritten" : "");
+	else
+		ESP_LOGI(TAG, "Loaded %u preset files.", (unsigned)presetFileCount);
+}
+
 // Phase 2: load presets + run the reconfigure decision. May format the filesystem and
 // reboot (esp32Settings_NewDeviceConfig). Returns the boot flag value as read from storage.
 uint8_t esp32Settings_BootFinishTagged(void)
@@ -315,7 +416,11 @@ uint8_t esp32Settings_BootFinishTagged(void)
 	}
 
 	settings_tlv_status_t pStatus = SETTINGS_TLV_OK;
-	if (tlvMounted && presetsPtr != NULL && tlvPresetDeserialize != NULL) {
+	if (presetFiles) {
+		// Skipped when the global load failed: that reconfigures (format + rewrite) anyway.
+		if (tlvMounted && presetsPtr != NULL && tlvGlobalStatus == SETTINGS_TLV_OK)
+			esp32Settings_ReadPresetFiles(true);
+	} else if (tlvMounted && presetsPtr != NULL && tlvPresetDeserialize != NULL) {
 		if (assignDefaultPresetSettings != NULL)
 			assignDefaultPresetSettings();
 		pStatus = esp32SettingsTlv_LoadFile(PRESETS_PATH, tlvPresetDeserialize, tlvCtx);
@@ -533,6 +638,10 @@ void esp32Settings_ReadPresets()
 		return;
 	}
 	ESP_LOGI(TAG, "Reading presets...");
+	if (tlvMode && presetFiles) {
+		esp32Settings_ReadPresetFiles(false);
+		return;
+	}
 	if (tlvMode) {
 		if (tlvPresetDeserialize == NULL) {
 			ESP_LOGE(TAG, "No preset deserialiser in tagged mode.");
@@ -555,6 +664,17 @@ void esp32Settings_SavePresets()
 		return;
 	}
 	ESP_LOGI(TAG, "Saving presets to file.");
+	if (tlvMode && presetFiles) {
+		uint16_t failed = 0;
+		for (uint16_t i = 0; i < presetFileCount; i++)
+			if (!esp32Settings_SavePreset(i))
+				failed++;
+		if (failed)
+			ESP_LOGE(TAG, "Presets save: %u of %u file(s) failed.", (unsigned)failed, (unsigned)presetFileCount);
+		else
+			ESP_LOGI(TAG, "Saved %u preset files.", (unsigned)presetFileCount);
+		return;
+	}
 	if (tlvMode) {
 		if (tlvPresetSerialize == NULL) {
 			ESP_LOGE(TAG, "No preset serialiser in tagged mode.");

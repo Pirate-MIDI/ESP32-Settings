@@ -56,6 +56,33 @@ void esp32Settings_BootBeginTagged(
 		uint8_t* bootFlag, void* ctx);
 uint8_t esp32Settings_BootFinishTagged(void);
 
+// ---------------------------------------------------------------------------
+// Per-preset files (tagged mode only, optional).
+//
+// Call BEFORE esp32Settings_BootBeginTagged. Each preset is then stored as its own TLV file
+// (/lfs/presets/pNNN.tlv, own header + CRC, written atomically via tmp + rename) instead of
+// one blob holding every preset, so:
+//   - one preset can be saved on its own (esp32Settings_SavePreset);
+//   - a missing or corrupt preset file resets ONLY that preset to defaults (via
+//     defaultOne) and is rewritten — preset data never triggers a factory reconfigure;
+//   - esp32Settings_SavePresets / ReadPresets still cover all of them.
+// The single-blob presets file of the default layout is not read in this mode (no migration);
+// pass NULL preset (de)serialisers to BootBeginTagged.
+// The per-item callbacks write/read ONE preset's records (tags need no index).
+// Not thread-safe: save/read presets from one task at a time.
+// ---------------------------------------------------------------------------
+typedef bool (*settings_item_serialize_fn)(tlv_writer_t *w, uint16_t index, void *ctx);
+typedef bool (*settings_item_deserialize_fn)(tlv_reader_t *r, uint16_t index, void *ctx);
+
+void esp32Settings_UsePresetFiles(uint16_t numPresets,
+                                  settings_item_serialize_fn serialize,
+                                  settings_item_deserialize_fn deserialize,
+                                  void (*defaultOne)(uint16_t index));
+// Per-preset-file mode only. Return false on an I/O failure / out-of-range index (Read:
+// the preset has been reset to defaults in that case).
+bool esp32Settings_SavePreset(uint16_t index);
+bool esp32Settings_ReadPreset(uint16_t index);
+
 // Optional hook invoked once, immediately before a factory reconfigure formats the
 // filesystem (from esp32Settings_NewDeviceConfig). Lets the app surface a "resetting"
 // message on an already-visible display before the blocking format. NULL = no callback.
