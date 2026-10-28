@@ -60,14 +60,18 @@ uint8_t esp32Settings_BootFinishTagged(void);
 // Grouped preset files (tagged mode only, optional).
 //
 // Call BEFORE esp32Settings_BootBeginTagged. Presets are then stored `perFile` to a TLV file
-// (/lfs/presets/gNNN.tlv, own header + CRC, written atomically via tmp + rename), one
-// container record per preset, instead of one blob holding every preset, so:
+// (/lfs/presets/gPP-NNN.tlv, PP = perFile; own header + CRC, written atomically via tmp +
+// rename), one container record per preset, instead of one blob holding every preset, so:
 //   - one preset can be saved on its own (esp32Settings_SavePreset rewrites its group);
 //   - a missing or corrupt file resets ONLY that group's presets to defaults (via
 //     defaultOne) and is rewritten — preset data never triggers a factory reconfigure;
 //   - esp32Settings_SavePresets / ReadPresets still cover all of them.
 // Grouping exists for boot time: each littlefs open costs a directory lookup, so 128 single
-// files took ~2.2 s to load on N8 (beta.2). perFile 1..32.
+// files took ~2.2 s to load on N8 (beta.2). But every file rounds up to whole 4 KB erase
+// blocks, so small groups make a full save slower — size perFile so a worst-case group nearly
+// fills its last block. perFile 1..32. Changing perFile changes the file names; on the first
+// boot after a change the presets come up as defaults and files of any other layout in
+// /lfs/presets are deleted.
 // The single-blob presets file of the default layout is not read in this mode (no migration);
 // pass NULL preset (de)serialisers to BootBeginTagged.
 // The per-item callbacks write/read ONE preset's records (tags need no index). The serialiser

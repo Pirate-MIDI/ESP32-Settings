@@ -76,7 +76,8 @@ static settings_tlv_status_t   tlvGlobalStatus = SETTINGS_TLV_OK;  // global-loa
 static void (*factoryResetNotify)(void) = NULL;
 
 // Grouped preset files (esp32Settings_UsePresetFiles). PRESETS_PATH is unused in that mode.
-// File gNNN.tlv holds presets [NNN*perFile, NNN*perFile + perFile), one container record each:
+// File gPP-NNN.tlv (PP = presets per file) holds presets [NNN*PP, NNN*PP + PP), one container
+// record each. PP is in the name so files from a different grouping never get misread:
 //   [PRESET_ITEM_TAG][len] [u16 preset index] [that preset's own records ...]
 #define PRESET_DIR                 SETTINGS_BASE_PATH "/presets"
 #define PRESET_ITEM_TAG            0x0001
@@ -92,6 +93,7 @@ static void                       (*defaultOnePreset)(uint16_t) = NULL;
 static uint16_t                     sGroup           = 0;
 static uint16_t                     sOnlyIndex       = UINT16_MAX;  // ReadPreset: decode just this one
 static uint32_t                     sGroupSeen       = 0;           // bit per preset found in the file
+static bool                         sGroupFileMissing = false;      // a group file was absent (layout change)
 
 static void presetGroupRange(uint16_t group, uint16_t *first, uint16_t *end)
 {
@@ -101,10 +103,15 @@ static void presetGroupRange(uint16_t group, uint16_t *first, uint16_t *end)
 		*end = presetItemCount;
 }
 
+static void presetGroupName(uint16_t group, char *name)
+{
+	sprintf(name, "g%02u-%03u.tlv", (unsigned)presetsPerFile, (unsigned)group);
+}
+
 static void presetGroupPaths(uint16_t group, char *path, char *tmp)
 {
-	sprintf(path, PRESET_DIR "/g%03u.tlv", (unsigned)group);
-	sprintf(tmp,  PRESET_DIR "/g%03u.tmp", (unsigned)group);
+	sprintf(path, PRESET_DIR "/g%02u-%03u.tlv", (unsigned)presetsPerFile, (unsigned)group);
+	sprintf(tmp,  PRESET_DIR "/g%02u-%03u.tmp", (unsigned)presetsPerFile, (unsigned)group);
 }
 
 static bool presetGroupSerialize(tlv_writer_t *w, void *ctx)
@@ -167,18 +174,52 @@ static void presetGroupDefault(uint16_t group)
 			defaultOnePreset(i);
 }
 
-// beta.2 dev builds stored one file per preset (pNNN.tlv). Nothing reads them now; delete
-// them so they don't hold flash or lengthen lookups in PRESET_DIR. Only runs when a group
-// file is missing (first boot after the change, or right after a format).
-static void presetGroupRemoveLegacy(uint16_t group)
+// Delete every file in PRESET_DIR that is not one of the current layout's group files: older
+// layouts (beta.2 pNNN.tlv, beta.3 gNNN.tlv, another perFile) and stray .tmp files. They hold
+// flash and lengthen every lookup in the directory. Called only when a group file was missing,
+// i.e. the first boot after a layout change. Entries are collected first and removed after
+// closedir, because removing while iterating a littlefs directory can skip entries.
+static void presetDirPrune(void)
 {
-	uint16_t first, end;
-	presetGroupRange(group, &first, &end);
-	char path[48];
-	for (uint16_t i = first; i < end; i++) {
-		sprintf(path, PRESET_DIR "/p%03u.tlv", (unsigned)i);
-		remove(path);
+	char batch[8][40];
+	uint16_t removed = 0;
+	for (;;) {
+		DIR *dir = opendir(PRESET_DIR);
+		if (dir == NULL)
+			return;
+		uint8_t n = 0;
+		struct dirent *e;
+		while (n < 8 && (e = readdir(dir)) != NULL) {
+			unsigned pp, g;
+			char tail[8];
+			bool current = (sscanf(e->d_name, "g%2u-%3u.%7s", &pp, &g, tail) == 3) &&
+			               pp == presetsPerFile && g < presetGroupCount && strcmp(tail, "tlv") == 0;
+			char want[24];
+			if (current) {
+				presetGroupName((uint16_t)g, want);
+				current = (strcmp(e->d_name, want) == 0);   // exact spelling, e.g. no "g16-0.tlv"
+			}
+			if (!current && e->d_name[0] != '.' && strlen(e->d_name) < sizeof batch[0])
+				strcpy(batch[n++], e->d_name);
+		}
+		closedir(dir);
+		if (n == 0)
+			break;
+		uint8_t gone = 0;
+		for (uint8_t i = 0; i < n; i++) {
+			char path[64];
+			sprintf(path, PRESET_DIR "/%s", batch[i]);
+			if (remove(path) == 0)
+				gone++;
+			else
+				ESP_LOGW(TAG, "Could not remove %s", path);
+		}
+		removed += gone;
+		if (n < 8 || gone == 0)
+			break;   // directory done, or stuck on files that will not delete
 	}
+	if (removed)
+		ESP_LOGI(TAG, "Removed %u file(s) from an older preset layout.", (unsigned)removed);
 }
 
 static bool presetGroupSave(uint16_t group)
@@ -224,7 +265,7 @@ static bool presetGroupRead(uint16_t group)
 	presetGroupDefault(group);
 	if (st == SETTINGS_TLV_MISSING) {
 		ESP_LOGW(TAG, "Preset group %u: no file — defaults.", (unsigned)group);
-		presetGroupRemoveLegacy(group);
+		sGroupFileMissing = true;
 	} else {
 		ESP_LOGW(TAG, "Preset group %u: file invalid (status %d) — defaults.", (unsigned)group, (int)st);
 	}
@@ -509,6 +550,7 @@ bool esp32Settings_ReadPreset(uint16_t index)
 static void esp32Settings_ReadPresetFiles(bool heal)
 {
 	uint16_t bad = 0;
+	sGroupFileMissing = false;
 	for (uint16_t g = 0; g < presetGroupCount; g++) {
 		if (!presetGroupRead(g)) {
 			bad++;
@@ -516,6 +558,8 @@ static void esp32Settings_ReadPresetFiles(bool heal)
 				presetGroupSave(g);
 		}
 	}
+	if (heal && sGroupFileMissing)
+		presetDirPrune();
 	if (bad)
 		ESP_LOGW(TAG, "%u of %u preset file(s) missing/invalid — reset to defaults%s.",
 		         (unsigned)bad, (unsigned)presetGroupCount, heal ? " and rewritten" : "");
