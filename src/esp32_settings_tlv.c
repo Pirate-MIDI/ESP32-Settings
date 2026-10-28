@@ -36,9 +36,22 @@ bool esp32SettingsTlv_BeginWrite(tlv_writer_t *w, const char *tmp_path)
 	return true;
 }
 
+void esp32SettingsTlv_BeginCount(tlv_writer_t *w)
+{
+	memset(w, 0, sizeof(*w));
+	w->ok = true;
+	w->count = true;
+}
+
 void esp32SettingsTlv_WriteRaw(tlv_writer_t *w, const void *data, uint16_t len)
 {
-	if (!w->ok || w->f == NULL)
+	if (!w->ok)
+		return;
+	if (w->count) {
+		w->len += len;
+		return;
+	}
+	if (w->f == NULL)
 		return;
 	if (fwrite(data, 1, len, w->f) != len) {
 		// Almost always heap exhaustion in the caller starving the littlefs
@@ -197,11 +210,13 @@ bool esp32SettingsTlv_NextRecord(tlv_reader_t *r, uint16_t *tag, uint16_t *len)
 	if (r->err)
 		return false;
 
-	if (r->consumed >= r->payload_len)
-		return false; // clean end of payload
+	// Inside a container (EnterRecord) the stream ends at its limit, not the payload's.
+	uint32_t end = r->limit ? r->limit : r->payload_len;
+	if (r->consumed >= end)
+		return false; // clean end of payload / container
 
 	uint8_t hdr[4];
-	if (r->payload_len - r->consumed < sizeof hdr ||
+	if (end - r->consumed < sizeof hdr ||
 	    fread(hdr, 1, sizeof hdr, r->f) != sizeof hdr) {
 		r->err = true;
 		return false;
@@ -212,8 +227,8 @@ bool esp32SettingsTlv_NextRecord(tlv_reader_t *r, uint16_t *tag, uint16_t *len)
 	uint16_t t, l;
 	memcpy(&t, &hdr[0], sizeof t);
 	memcpy(&l, &hdr[2], sizeof l);
-	if ((uint32_t)l > r->payload_len - r->consumed) {
-		r->err = true; // record claims more bytes than the payload holds
+	if ((uint32_t)l > end - r->consumed) {
+		r->err = true; // record claims more bytes than the payload / container holds
 		return false;
 	}
 	r->cur_len = l;
@@ -247,6 +262,38 @@ void esp32SettingsTlv_SkipRaw(tlv_reader_t *r, uint16_t n)
 uint16_t esp32SettingsTlv_RecordRemaining(const tlv_reader_t *r)
 {
 	return r->cur_len - r->cur_read;
+}
+
+void esp32SettingsTlv_EnterRecord(tlv_reader_t *r)
+{
+	if (r->err || r->limit != 0) {
+		r->err = true;   // one nesting level only
+		return;
+	}
+	r->limit = r->consumed + (uint32_t)(r->cur_len - r->cur_read);
+	r->cur_len = 0;
+	r->cur_read = 0;
+}
+
+void esp32SettingsTlv_ExitRecord(tlv_reader_t *r)
+{
+	if (r->limit == 0)
+		return;
+	if (!r->err) {
+		// Drain the unread tail of the current inner record, then any inner records left.
+		if (r->cur_read < r->cur_len)
+			tlv_consume(r, NULL, 0, r->cur_len - r->cur_read);
+		if (!r->err && r->consumed < r->limit) {
+			r->cur_len = (uint16_t)(r->limit - r->consumed);   // container value is <= 0xFFFF
+			r->cur_read = 0;
+			tlv_consume(r, NULL, 0, r->cur_len);
+		}
+		if (r->consumed != r->limit)
+			r->err = true;
+	}
+	r->limit = 0;
+	r->cur_len = 0;
+	r->cur_read = 0;
 }
 
 bool esp32SettingsTlv_FinishRead(tlv_reader_t *r)

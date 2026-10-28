@@ -75,23 +75,160 @@ static settings_tlv_status_t   tlvGlobalStatus = SETTINGS_TLV_OK;  // global-loa
 // Optional "about to factory reset" notification (see esp32Settings_SetFactoryResetNotify).
 static void (*factoryResetNotify)(void) = NULL;
 
-// Per-preset files (esp32Settings_UsePresetFiles). PRESETS_PATH is unused in that mode.
+// Grouped preset files (esp32Settings_UsePresetFiles). PRESETS_PATH is unused in that mode.
+// File gNNN.tlv holds presets [NNN*perFile, NNN*perFile + perFile), one container record each:
+//   [PRESET_ITEM_TAG][len] [u16 preset index] [that preset's own records ...]
 #define PRESET_DIR                 SETTINGS_BASE_PATH "/presets"
+#define PRESET_ITEM_TAG            0x0001
+#define PRESETS_PER_FILE_MAX       32      // sGroupSeen is a 32-bit mask
 static bool                         presetFiles      = false;
-static uint16_t                     presetFileCount  = 0;
+static uint16_t                     presetItemCount  = 0;   // presets covered
+static uint16_t                     presetsPerFile   = 1;
+static uint16_t                     presetGroupCount = 0;
 static settings_item_serialize_fn   itemSerialize    = NULL;
 static settings_item_deserialize_fn itemDeserialize  = NULL;
 static void                       (*defaultOnePreset)(uint16_t) = NULL;
-// The TLV file helpers take index-free callbacks; these trampolines carry the index.
-static uint16_t                     sItemIndex       = 0;
+// The TLV file helpers take index-free callbacks; these carry the group being worked on.
+static uint16_t                     sGroup           = 0;
+static uint16_t                     sOnlyIndex       = UINT16_MAX;  // ReadPreset: decode just this one
+static uint32_t                     sGroupSeen       = 0;           // bit per preset found in the file
 
-static bool itemSerializeTramp(tlv_writer_t *w, void *ctx)   { return itemSerialize(w, sItemIndex, ctx); }
-static bool itemDeserializeTramp(tlv_reader_t *r, void *ctx) { return itemDeserialize(r, sItemIndex, ctx); }
-
-static void presetFilePaths(uint16_t index, char *path, char *tmp)
+static void presetGroupRange(uint16_t group, uint16_t *first, uint16_t *end)
 {
-	sprintf(path, PRESET_DIR "/p%03u.tlv", (unsigned)index);
-	sprintf(tmp,  PRESET_DIR "/p%03u.tmp", (unsigned)index);
+	*first = group * presetsPerFile;
+	*end   = *first + presetsPerFile;
+	if (*end > presetItemCount)
+		*end = presetItemCount;
+}
+
+static void presetGroupPaths(uint16_t group, char *path, char *tmp)
+{
+	sprintf(path, PRESET_DIR "/g%03u.tlv", (unsigned)group);
+	sprintf(tmp,  PRESET_DIR "/g%03u.tmp", (unsigned)group);
+}
+
+static bool presetGroupSerialize(tlv_writer_t *w, void *ctx)
+{
+	uint16_t first, end;
+	presetGroupRange(sGroup, &first, &end);
+	for (uint16_t i = first; i < end; i++) {
+		// Dry run to size the container, then the real write; the serialiser must be
+		// deterministic (it only reads RAM), which the length check below enforces.
+		tlv_writer_t c;
+		esp32SettingsTlv_BeginCount(&c);
+		esp32SettingsTlv_WriteRaw(&c, &i, sizeof i);
+		if (!itemSerialize(&c, i, ctx) || c.len > UINT16_MAX) {
+			ESP_LOGE(TAG, "Preset %u: serialise failed or > 64 KB.", (unsigned)i);
+			return false;
+		}
+		esp32SettingsTlv_WriteRecordHeader(w, PRESET_ITEM_TAG, (uint16_t)c.len);
+		uint32_t start = w->len;
+		esp32SettingsTlv_WriteRaw(w, &i, sizeof i);
+		if (!itemSerialize(w, i, ctx))
+			return false;
+		if (w->ok && w->len - start != c.len) {
+			ESP_LOGE(TAG, "Preset %u: serialiser wrote %u bytes, sized %u.",
+			         (unsigned)i, (unsigned)(w->len - start), (unsigned)c.len);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool presetGroupDeserialize(tlv_reader_t *r, void *ctx)
+{
+	uint16_t first, end;
+	presetGroupRange(sGroup, &first, &end);
+	uint16_t tag, len;
+	while (esp32SettingsTlv_NextRecord(r, &tag, &len)) {
+		if (tag != PRESET_ITEM_TAG || len < sizeof(uint16_t))
+			continue;   // unknown top-level record: NextRecord drains it
+		uint16_t idx;
+		if (esp32SettingsTlv_ReadRaw(r, &idx, sizeof idx) != sizeof idx)
+			break;      // short read: FinishRead reports it
+		if (idx < first || idx >= end || (sOnlyIndex != UINT16_MAX && idx != sOnlyIndex))
+			continue;
+		esp32SettingsTlv_EnterRecord(r);
+		bool ok = itemDeserialize(r, idx, ctx);
+		esp32SettingsTlv_ExitRecord(r);
+		if (!ok)
+			return false;
+		sGroupSeen |= 1u << (idx - first);
+	}
+	return true;
+}
+
+static void presetGroupDefault(uint16_t group)
+{
+	uint16_t first, end;
+	presetGroupRange(group, &first, &end);
+	for (uint16_t i = first; i < end; i++)
+		if (sOnlyIndex == UINT16_MAX || i == sOnlyIndex)
+			defaultOnePreset(i);
+}
+
+// beta.2 dev builds stored one file per preset (pNNN.tlv). Nothing reads them now; delete
+// them so they don't hold flash or lengthen lookups in PRESET_DIR. Only runs when a group
+// file is missing (first boot after the change, or right after a format).
+static void presetGroupRemoveLegacy(uint16_t group)
+{
+	uint16_t first, end;
+	presetGroupRange(group, &first, &end);
+	char path[48];
+	for (uint16_t i = first; i < end; i++) {
+		sprintf(path, PRESET_DIR "/p%03u.tlv", (unsigned)i);
+		remove(path);
+	}
+}
+
+static bool presetGroupSave(uint16_t group)
+{
+	struct stat st;
+	if (stat(PRESET_DIR, &st) != 0 && mkdir(PRESET_DIR, 0775) != 0) {
+		ESP_LOGE(TAG, "Could not create %s", PRESET_DIR);
+		return false;
+	}
+	char path[48], tmp[48];
+	presetGroupPaths(group, path, tmp);
+	sGroup = group;
+	if (!esp32SettingsTlv_SaveFile(path, tmp, presetGroupSerialize, tlvCtx)) {
+		ESP_LOGE(TAG, "Preset group %u save failed.", (unsigned)group);
+		return false;
+	}
+	return true;
+}
+
+// Load one group file (all of it, or only sOnlyIndex). Presets absent from the file keep
+// defaults. Returns false if the file was missing/invalid or lacked any requested preset.
+static bool presetGroupRead(uint16_t group)
+{
+	uint16_t first, end;
+	presetGroupRange(group, &first, &end);
+	char path[48], tmp[48];
+	presetGroupPaths(group, path, tmp);
+
+	presetGroupDefault(group);   // defaults under any tag / preset absent from the file
+	sGroup = group;
+	sGroupSeen = 0;
+	settings_tlv_status_t st = esp32SettingsTlv_LoadFile(path, presetGroupDeserialize, tlvCtx);
+	if (st == SETTINGS_TLV_OK) {
+		uint32_t want = (sOnlyIndex != UINT16_MAX) ? (1u << (sOnlyIndex - first))
+		                                           : ((1u << (end - first)) - 1u);
+		if ((sGroupSeen & want) == want)
+			return true;
+		ESP_LOGW(TAG, "Preset group %u: preset(s) missing from file — defaults.", (unsigned)group);
+		return false;
+	}
+	// A corrupt file is detected only after its records were decoded, so re-default to drop
+	// whatever was half-applied.
+	presetGroupDefault(group);
+	if (st == SETTINGS_TLV_MISSING) {
+		ESP_LOGW(TAG, "Preset group %u: no file — defaults.", (unsigned)group);
+		presetGroupRemoveLegacy(group);
+	} else {
+		ESP_LOGW(TAG, "Preset group %u: file invalid (status %d) — defaults.", (unsigned)group, (int)st);
+	}
+	return false;
 }
 
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels);
@@ -326,17 +463,20 @@ void esp32Settings_BootBeginTagged(
 // ---------------------------------------------------------------------------
 // Per-preset files
 // ---------------------------------------------------------------------------
-void esp32Settings_UsePresetFiles(uint16_t numPresetFiles,
+void esp32Settings_UsePresetFiles(uint16_t numPresets, uint16_t perFile,
                                   settings_item_serialize_fn serialize,
                                   settings_item_deserialize_fn deserialize,
                                   void (*defaultOne)(uint16_t index))
 {
-	if (numPresetFiles == 0 || serialize == NULL || deserialize == NULL || defaultOne == NULL) {
+	if (numPresets == 0 || perFile == 0 || perFile > PRESETS_PER_FILE_MAX ||
+	    serialize == NULL || deserialize == NULL || defaultOne == NULL) {
 		ESP_LOGE(TAG, "UsePresetFiles: invalid arguments — staying on the single preset file.");
 		return;
 	}
 	presetFiles      = true;
-	presetFileCount  = numPresetFiles;
+	presetItemCount  = numPresets;
+	presetsPerFile   = perFile;
+	presetGroupCount = (uint16_t)((numPresets + perFile - 1) / perFile);
 	itemSerialize    = serialize;
 	itemDeserialize  = deserialize;
 	defaultOnePreset = defaultOne;
@@ -344,65 +484,43 @@ void esp32Settings_UsePresetFiles(uint16_t numPresetFiles,
 
 bool esp32Settings_SavePreset(uint16_t index)
 {
-	if (!presetFiles || presetsPtr == NULL || index >= presetFileCount) {
-		ESP_LOGE(TAG, "SavePreset(%u): per-preset files not in use or index out of range.", (unsigned)index);
+	if (!presetFiles || presetsPtr == NULL || index >= presetItemCount) {
+		ESP_LOGE(TAG, "SavePreset(%u): preset files not in use or index out of range.", (unsigned)index);
 		return false;
 	}
-	struct stat st;
-	if (stat(PRESET_DIR, &st) != 0 && mkdir(PRESET_DIR, 0775) != 0) {
-		ESP_LOGE(TAG, "Could not create %s", PRESET_DIR);
-		return false;
-	}
-	char path[48], tmp[48];
-	presetFilePaths(index, path, tmp);
-	sItemIndex = index;
-	if (!esp32SettingsTlv_SaveFile(path, tmp, itemSerializeTramp, tlvCtx)) {
-		ESP_LOGE(TAG, "Preset %u save failed.", (unsigned)index);
-		return false;
-	}
-	return true;
+	// Rewrites the preset's whole group from RAM (RAM is authoritative for its neighbours too).
+	return presetGroupSave(index / presetsPerFile);
 }
 
 bool esp32Settings_ReadPreset(uint16_t index)
 {
-	if (!presetFiles || presetsPtr == NULL || index >= presetFileCount) {
-		ESP_LOGE(TAG, "ReadPreset(%u): per-preset files not in use or index out of range.", (unsigned)index);
+	if (!presetFiles || presetsPtr == NULL || index >= presetItemCount) {
+		ESP_LOGE(TAG, "ReadPreset(%u): preset files not in use or index out of range.", (unsigned)index);
 		return false;
 	}
-	char path[48], tmp[48];
-	presetFilePaths(index, path, tmp);
-	defaultOnePreset(index);   // defaults under any tag absent from the file
-	sItemIndex = index;
-	settings_tlv_status_t st = esp32SettingsTlv_LoadFile(path, itemDeserializeTramp, tlvCtx);
-	if (st == SETTINGS_TLV_OK)
-		return true;
-	// A corrupt file is detected only after its records were decoded, so re-default to drop
-	// whatever was half-applied.
-	defaultOnePreset(index);
-	if (st == SETTINGS_TLV_MISSING)
-		ESP_LOGW(TAG, "Preset %u: no file — defaults.", (unsigned)index);
-	else
-		ESP_LOGW(TAG, "Preset %u: file invalid (status %d) — defaults.", (unsigned)index, (int)st);
-	return false;
+	sOnlyIndex = index;
+	bool ok = presetGroupRead(index / presetsPerFile);
+	sOnlyIndex = UINT16_MAX;
+	return ok;
 }
 
-// Read every preset file; with `heal`, rewrite any that were missing/corrupt with defaults so
-// the warning does not repeat on every boot.
+// Read every group file; with `heal`, rewrite any that were missing/corrupt/incomplete so the
+// warning does not repeat on every boot.
 static void esp32Settings_ReadPresetFiles(bool heal)
 {
 	uint16_t bad = 0;
-	for (uint16_t i = 0; i < presetFileCount; i++) {
-		if (!esp32Settings_ReadPreset(i)) {
+	for (uint16_t g = 0; g < presetGroupCount; g++) {
+		if (!presetGroupRead(g)) {
 			bad++;
 			if (heal)
-				esp32Settings_SavePreset(i);
+				presetGroupSave(g);
 		}
 	}
 	if (bad)
 		ESP_LOGW(TAG, "%u of %u preset file(s) missing/invalid — reset to defaults%s.",
-		         (unsigned)bad, (unsigned)presetFileCount, heal ? " and rewritten" : "");
+		         (unsigned)bad, (unsigned)presetGroupCount, heal ? " and rewritten" : "");
 	else
-		ESP_LOGI(TAG, "Loaded %u preset files.", (unsigned)presetFileCount);
+		ESP_LOGI(TAG, "Loaded %u presets from %u files.", (unsigned)presetItemCount, (unsigned)presetGroupCount);
 }
 
 // Phase 2: load presets + run the reconfigure decision. May format the filesystem and
@@ -666,13 +784,13 @@ void esp32Settings_SavePresets()
 	ESP_LOGI(TAG, "Saving presets to file.");
 	if (tlvMode && presetFiles) {
 		uint16_t failed = 0;
-		for (uint16_t i = 0; i < presetFileCount; i++)
-			if (!esp32Settings_SavePreset(i))
+		for (uint16_t g = 0; g < presetGroupCount; g++)
+			if (!presetGroupSave(g))
 				failed++;
 		if (failed)
-			ESP_LOGE(TAG, "Presets save: %u of %u file(s) failed.", (unsigned)failed, (unsigned)presetFileCount);
+			ESP_LOGE(TAG, "Presets save: %u of %u file(s) failed.", (unsigned)failed, (unsigned)presetGroupCount);
 		else
-			ESP_LOGI(TAG, "Saved %u preset files.", (unsigned)presetFileCount);
+			ESP_LOGI(TAG, "Saved %u presets to %u files.", (unsigned)presetItemCount, (unsigned)presetGroupCount);
 		return;
 	}
 	if (tlvMode) {
@@ -691,6 +809,17 @@ void esp32Settings_SavePresets()
 // Diagnostic directory listing (VERBOSE only) via POSIX dirent over the VFS mount.
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels)
 {
+	// The walk itself is expensive — two littlefs stat() calls per entry, each a linear
+	// directory search — so skip it entirely unless its VERBOSE output can actually print.
+	// With per-preset files (128 entries) it otherwise ran ~4 s on the boot path without
+	// yielding and tripped the task watchdog (IDLE0 starved), even with the output compiled out.
+#if LOG_LOCAL_LEVEL < ESP_LOG_VERBOSE
+	(void)dirname;
+	(void)levels;
+	return;
+#else
+	if (esp_log_level_get(TAG) < ESP_LOG_VERBOSE)
+		return;
 	ESP_LOGV(TAG, "Listing directory: %s", dirname);
 
 	DIR *dir = opendir(dirname);
@@ -718,4 +847,5 @@ static void esp32Settings_ListDir(const char *dirname, uint8_t levels)
 	}
 	closedir(dir);
 	ESP_LOGV(TAG, "directory listing complete.");
+#endif
 }

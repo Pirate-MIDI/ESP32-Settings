@@ -69,10 +69,14 @@ typedef struct {
 	uint32_t crc;   // running CRC over payload written so far
 	uint32_t len;   // payload bytes written so far
 	bool     ok;    // cleared on the first short write; makes later calls no-ops
+	bool     count; // counting-only writer (BeginCount): no file, no CRC, just `len`
 } tlv_writer_t;
 
 // Open <tmp_path> and reserve space for the header (back-patched by FinishWrite).
 bool     esp32SettingsTlv_BeginWrite(tlv_writer_t *w, const char *tmp_path);
+// Counting-only writer: run a serialiser into it to learn how many payload bytes it emits
+// (w->len) without touching storage. Used to size a container record before writing it.
+void     esp32SettingsTlv_BeginCount(tlv_writer_t *w);
 // Low-level: emit a record header, then raw value bytes (both CRC'd + counted).
 void     esp32SettingsTlv_WriteRecordHeader(tlv_writer_t *w, uint16_t tag, uint16_t len);
 void     esp32SettingsTlv_WriteRaw(tlv_writer_t *w, const void *data, uint16_t len);
@@ -95,6 +99,7 @@ typedef struct {
 	uint16_t cur_len;      // length of the record currently being read
 	uint16_t cur_read;     // bytes of the current record already consumed
 	bool     err;          // a short read / corruption was seen
+	uint32_t limit;        // EnterRecord: payload offset where the nested stream ends (0 = none)
 } tlv_reader_t;
 
 // Open + validate the header. Returns MISSING / BAD_HEADER on failure (file is
@@ -114,6 +119,11 @@ uint16_t esp32SettingsTlv_ReadRaw(tlv_reader_t *r, void *dst, uint16_t n);
 void     esp32SettingsTlv_SkipRaw(tlv_reader_t *r, uint16_t n);
 // Bytes left in the current record.
 uint16_t esp32SettingsTlv_RecordRemaining(const tlv_reader_t *r);
+// Container records (one level): EnterRecord treats the rest of the current record's value
+// as a nested record stream, so NextRecord returns false at its end instead of the payload's.
+// ExitRecord skips whatever the nested reader left unread and resumes the outer stream.
+void     esp32SettingsTlv_EnterRecord(tlv_reader_t *r);
+void     esp32SettingsTlv_ExitRecord(tlv_reader_t *r);
 // Close + verify the whole payload was consumed and the CRC matches. Call once,
 // after NextRecord has returned false. Returns false on CRC/length mismatch.
 bool     esp32SettingsTlv_FinishRead(tlv_reader_t *r);
